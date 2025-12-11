@@ -215,7 +215,9 @@ public class MyExtractor extends BaseExtractor {
     }
 
     private List<int[]> buildCFGEdges(List<NodeInfo> nodeInfos) {
-        List<int[]> edges = new ArrayList<>();
+        Map<Integer, NodeInfo> nodeMap = new HashMap<>();
+        for (NodeInfo n : nodeInfos) nodeMap.put(n.id, n);
+
 
         // 1. 按 parent 分组：构造 childrenMap
         Map<Integer, List<NodeInfo>> childrenMap = new HashMap<>();
@@ -225,77 +227,364 @@ public class MyExtractor extends BaseExtractor {
             }
         }
 
-        // 2. 顶层节点（parent == -1）
-        List<NodeInfo> topNodes = new ArrayList<>();
+        for (List<NodeInfo> list : childrenMap.values()) {
+            list.sort(Comparator.comparingInt(n -> n.startX));
+        }
+
+        List<NodeInfo> roots = new ArrayList<>();
+
         for (NodeInfo node : nodeInfos) {
-            if (node.parent == -1) {
-                topNodes.add(node);
+            if (node.parent == -1 && (node.kind == null || !node.kind.contains("pseudo-return"))) {
+                roots.add(node);
+            }
+        }
+        roots.sort(Comparator.comparingInt(n -> n.startX));
+
+        NodeInfo pseudoReturn = null;
+        for (NodeInfo n : nodeInfos) {
+            if (n.kind.contains("pseudo-return")) {
+                pseudoReturn = n;
+                break;
             }
         }
 
-        // 按 startX 排序顶层节点，模拟代码从左到右的顺序
-        topNodes.sort(Comparator.comparingInt(n -> n.startX));
+        List<int[]> edges = new ArrayList<>();
+        Set<String> edgeSet = new HashSet<>();
 
-        // 3. 处理每个 for-statement：内部边 + false 分支
-        for (NodeInfo top : topNodes) {
-            if (top.kind.startsWith("for-statement")) {
-                List<NodeInfo> children = childrenMap.getOrDefault(top.id, Collections.emptyList());
-
-                NodeInfo cond = null;
-                NodeInfo body = null;
-                for (NodeInfo child : children) {
-                    if (child.kind.startsWith("for-condition")) {
-                        cond = child;
-                    } else if (child.kind.startsWith("for-body")) {
-                        body = child;
-                    }
-                }
-                if (cond == null || body == null) {
-                    continue;
-                }
-
-                // loop -> cond
-                edges.add(new int[]{top.id, cond.id});
-                // cond -> body（true 分支）
-                edges.add(new int[]{cond.id, body.id});
-                // body -> cond（回边）
-                edges.add(new int[]{body.id, cond.id});
-
-                // false 分支：cond -> 下一个非循环顶层语句（且不是 pseudo-return）
-                NodeInfo nextStmt = null;
-                boolean seen = false;
-                for (NodeInfo tn : topNodes) {
-                    if (!seen) {
-                        seen = tn.id == top.id;
-                        continue;
-                    }
-                    if (tn.kind.startsWith("for-statement") || tn.kind.startsWith("pseudo-return")) {
-                        continue;
-                    }
-
-                    nextStmt = tn;
-                    break;
-                }
-                if (nextStmt != null) {
-                    edges.add(new int[]{cond.id, nextStmt.id});
+        for (NodeInfo node : nodeInfos) {
+            switch (classify(node.kind)) {
+                case IF -> handleIf(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case FOR -> handleFor(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case WHILE -> handleWhile(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case DO_WHILE -> handleDoWhile(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case SWITCH -> handleSwitch(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case BREAK -> handleBreak(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case CONTINUE -> handleContinue(node, nodeMap, childrenMap, roots, pseudoReturn, edges, edgeSet);
+                case RETURN -> handleReturn(node, pseudoReturn, edges, edgeSet);
+                default -> {
                 }
             }
         }
 
-        // 4. 非循环顶层语句之间的顺序边：当前为普通语句，后一个为 for-statement
-        for (int i = 0; i < topNodes.size() - 1; i++) {
-            NodeInfo cur = topNodes.get(i);
-            NodeInfo nxt = topNodes.get(i + 1);
-
-            if (!cur.kind.startsWith("for-statement")
-                    && !cur.kind.startsWith("pseudo-return")
-                    && !nxt.kind.startsWith("pseudo-return")) {
-                edges.add(new int[]{cur.id, nxt.id});
+        for (Map.Entry<Integer, List<NodeInfo>> entry : childrenMap.entrySet()) {
+            NodeInfo parent = nodeMap.get(entry.getKey());
+            if (parent != null && isControl(parent.kind)) {
+                continue;
             }
+            List<NodeInfo> siblings = entry.getValue();
+            siblings.sort(Comparator.comparingInt(n -> n.startX));
+            connectSiblings(siblings, nodeMap, childrenMap, edges, edgeSet);
         }
+        connectSiblings(roots, nodeMap, childrenMap, edges, edgeSet);
         return edges;
     }
 
+    private enum NodeKind {IF, FOR, WHILE, DO_WHILE, SWITCH, BREAK, CONTINUE, RETURN, OTHER}
+
+    private NodeKind classify(String kind) {
+        if (kind == null) return NodeKind.OTHER;
+        if (kind.startsWith("if-statement")) return NodeKind.IF;
+        if (kind.startsWith("for-statement") || kind.startsWith("enhanced-for")) return NodeKind.FOR;
+        if (kind.startsWith("while-statement")) return NodeKind.WHILE;
+        if (kind.startsWith("do-while")) return NodeKind.DO_WHILE;
+        if (kind.startsWith("switch-statement")) return NodeKind.SWITCH;
+        if (kind.startsWith("break")) return NodeKind.BREAK;
+        if (kind.startsWith("continue")) return NodeKind.CONTINUE;
+        if (kind.startsWith("return")) return NodeKind.RETURN;
+        return NodeKind.OTHER;
+    }
+
+    private boolean isControl(String kind) {
+        NodeKind nk = classify(kind);
+        return nk != NodeKind.OTHER;
+    }
+
+    private void handleIf(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                          Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                          List<int[]> edges, Set<String> edgeSet) {
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        NodeInfo cond = null, thenB = null, elseB = null;
+        for (NodeInfo c : children) {
+            if (c.kind.startsWith("if-condition")) cond = c;
+            else if (c.kind.startsWith("if-then")) thenB = c;
+            else if (c.kind.startsWith("if-else")) elseB = c;
+        }
+        if (cond == null) return;
+        addEdge(edges, edgeSet, node.id, cond.id);
+        NodeInfo after = findNext(node, nodeMap, childrenMap, roots, pseudoReturn);
+        if (thenB != null) {
+            addEdge(edges, edgeSet, cond.id, thenB.id);
+            NodeInfo thenExit = findBlockExit(thenB, nodeMap, childrenMap, pseudoReturn);
+            if (after != null && thenExit != null) addEdge(edges, edgeSet, thenExit.id, after.id);
+        } else if (after != null) {
+            addEdge(edges, edgeSet, cond.id, after.id);
+        }
+        if (elseB != null) {
+            addEdge(edges, edgeSet, cond.id, elseB.id);
+            NodeInfo elseExit = findBlockExit(elseB, nodeMap, childrenMap, pseudoReturn);
+            if (after != null && elseExit != null) addEdge(edges, edgeSet, elseExit.id, after.id);
+        } else if (after != null) {
+            addEdge(edges, edgeSet, cond.id, after.id);
+        }
+    }
+
+    private void handleFor(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                           Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                           List<int[]> edges, Set<String> edgeSet) {
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        NodeInfo cond = null, body = null, update = null;
+        for (NodeInfo c : children) {
+            if (c.kind.startsWith("for-condition")) cond = c;
+            else if (c.kind.startsWith("for-body")) body = c;
+            else if (c.kind.startsWith("for-update")) update = c;
+        }
+        if (cond == null) return;
+        addEdge(edges, edgeSet, node.id, cond.id);
+        if (body != null) addEdge(edges, edgeSet, cond.id, body.id);
+        if (body != null) {
+            addEdge(edges, edgeSet, body.id, cond.id);
+        }
+        NodeInfo after = findNext(node, nodeMap, childrenMap, roots, pseudoReturn);
+        if (after != null) addEdge(edges, edgeSet, cond.id, after.id);
+    }
+
+    private void handleWhile(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                             Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                             List<int[]> edges, Set<String> edgeSet) {
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        NodeInfo cond = null, body = null;
+        for (NodeInfo c : children) {
+            if (c.kind.startsWith("while-condition")) cond = c;
+            else if (c.kind.startsWith("while-body")) body = c;
+        }
+        if (cond == null) return;
+        addEdge(edges, edgeSet, node.id, cond.id);
+        if (body != null) {
+            addEdge(edges, edgeSet, cond.id, body.id);
+            addEdge(edges, edgeSet, body.id, cond.id);
+        }
+        NodeInfo after = findNext(node, nodeMap, childrenMap, roots, pseudoReturn);
+        if (after != null) addEdge(edges, edgeSet, cond.id, after.id);
+    }
+
+    private void handleDoWhile(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                               Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                               List<int[]> edges, Set<String> edgeSet) {
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        NodeInfo cond = null, body = null;
+        for (NodeInfo c : children) {
+            if (c.kind.contains("do-condition")) cond = c;
+            else if (c.kind.contains("do-body")) body = c;
+        }
+        if (body != null) addEdge(edges, edgeSet, node.id, body.id);
+        if (body != null && cond != null) addEdge(edges, edgeSet, body.id, cond.id);
+        if (cond != null) {
+            addEdge(edges, edgeSet, cond.id, body != null ? body.id : cond.id);
+            NodeInfo after = findNext(node, nodeMap, childrenMap, roots, pseudoReturn);
+            if (after != null) addEdge(edges, edgeSet, cond.id, after.id);
+        }
+    }
+
+    private void handleSwitch(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                              Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                              List<int[]> edges, Set<String> edgeSet) {
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        if (children.isEmpty()) return;
+        NodeInfo first = children.get(0);
+        addEdge(edges, edgeSet, node.id, first.id);
+        for (int i = 0; i < children.size() - 1; i++) {
+            addEdge(edges, edgeSet, children.get(i).id, children.get(i + 1).id);
+        }
+        NodeInfo after = findNext(node, nodeMap, childrenMap, roots, pseudoReturn);
+        if (after != null) {
+            for (NodeInfo c : children) addEdge(edges, edgeSet, c.id, after.id);
+        }
+    }
+
+    private void handleBreak(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                             Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                             List<int[]> edges, Set<String> edgeSet) {
+        NodeInfo target = findBreakTarget(node, nodeMap, childrenMap, roots, pseudoReturn);
+        if (target != null) addEdge(edges, edgeSet, node.id, target.id);
+    }
+
+    private void handleContinue(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                                Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn,
+                                List<int[]> edges, Set<String> edgeSet) {
+        NodeInfo target = findContinueTarget(node, nodeMap, childrenMap);
+        if (target != null) addEdge(edges, edgeSet, node.id, target.id);
+    }
+
+    private void handleReturn(NodeInfo node, NodeInfo pseudoReturn, List<int[]> edges, Set<String> edgeSet) {
+        if (pseudoReturn != null) {
+            addEdge(edges, edgeSet, node.id, pseudoReturn.id);
+        }
+    }
+
+    private NodeInfo findBreakTarget(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                                     Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn) {
+        NodeInfo cur = nodeMap.get(node.parent);
+        while (cur != null) {
+            if (classify(cur.kind) == NodeKind.SWITCH || classify(cur.kind) == NodeKind.FOR
+                    || classify(cur.kind) == NodeKind.WHILE || classify(cur.kind) == NodeKind.DO_WHILE) {
+                return findNext(cur, nodeMap, childrenMap, roots, pseudoReturn);
+            }
+            cur = nodeMap.get(cur.parent);
+        }
+        return pseudoReturn;
+    }
+
+    private NodeInfo findContinueTarget(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                                        Map<Integer, List<NodeInfo>> childrenMap) {
+        NodeInfo cur = nodeMap.get(node.parent);
+        while (cur != null) {
+            if (classify(cur.kind) == NodeKind.FOR) {
+                for (NodeInfo child : childrenMap.getOrDefault(cur.id, Collections.emptyList())) {
+                    if (child.kind.startsWith("for-update")) return child;
+                    if (child.kind.startsWith("for-condition")) return child;
+                }
+            } else if (classify(cur.kind) == NodeKind.WHILE || classify(cur.kind) == NodeKind.DO_WHILE) {
+                for (NodeInfo child : childrenMap.getOrDefault(cur.id, Collections.emptyList())) {
+                    if (child.kind.contains("condition")) return child;
+                }
+            }
+            cur = nodeMap.get(cur.parent);
+        }
+        return null;
+    }
+
+    private void connectSiblings(List<NodeInfo> siblings, Map<Integer, NodeInfo> nodeMap,
+                                 Map<Integer, List<NodeInfo>> childrenMap, List<int[]> edges,
+                                 Set<String> edgeSet) {
+        if (siblings == null || siblings.size() < 2) return;
+        for (int i = 0; i < siblings.size() - 1; i++) {
+            NodeInfo cur = siblings.get(i);
+            NodeInfo nxt = siblings.get(i + 1);
+
+            NodeKind kind = classify(cur.kind);
+            if (kind == NodeKind.BREAK || kind == NodeKind.CONTINUE || kind == NodeKind.RETURN) {
+                continue;
+            }
+
+            List<NodeInfo> exits = normalExits(cur, childrenMap, nodeMap, new HashSet<>());
+            NodeInfo entry = nxt;
+            for (NodeInfo ex : exits) {
+                if (ex == null) continue;
+                addEdge(edges, edgeSet, ex.id, entry.id);
+            }
+        }
+    }
+
+    private NodeInfo firstExecutable(NodeInfo node, Map<Integer, List<NodeInfo>> childrenMap,
+                                     Map<Integer, NodeInfo> nodeMap, Set<Integer> visiting) {
+        if (node == null || visiting.contains(node.id)) return node;
+        visiting.add(node.id);
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        NodeKind nk = classify(node.kind);
+        if (nk == NodeKind.IF || nk == NodeKind.WHILE || nk == NodeKind.FOR) {
+            for (NodeInfo c : children) {
+                if (c.kind.contains("condition")) return c;
+            }
+        } else if (nk == NodeKind.DO_WHILE) {
+            for (NodeInfo c : children) {
+                if (c.kind.contains("do-body")) return c;
+            }
+        } else if (nk == NodeKind.SWITCH) {
+            if (!children.isEmpty()) return children.get(0);
+        }
+
+        if (!children.isEmpty()) {
+            return firstExecutable(children.get(0), childrenMap, nodeMap, visiting);
+        }
+        return node;
+    }
+
+    private List<NodeInfo> normalExits(NodeInfo node, Map<Integer, List<NodeInfo>> childrenMap,
+                                       Map<Integer, NodeInfo> nodeMap, Set<Integer> visiting) {
+        List<NodeInfo> exits = new ArrayList<>();
+        if (node == null) return exits;
+        if (visiting.contains(node.id)) return exits;
+        visiting.add(node.id);
+        NodeKind nk = classify(node.kind);
+        if (nk == NodeKind.BREAK || nk == NodeKind.CONTINUE || nk == NodeKind.RETURN) {
+            return exits;
+        }
+        List<NodeInfo> children = childrenMap.getOrDefault(node.id, Collections.emptyList());
+        switch (nk) {
+            case IF -> {
+                NodeInfo thenB = null, elseB = null, cond = null;
+                for (NodeInfo c : children) {
+                    if (c.kind.contains("condition")) cond = c;
+                    else if (c.kind.contains("if-then")) thenB = c;
+                    else if (c.kind.contains("if-else")) elseB = c;
+                }
+                if (thenB != null) exits.addAll(normalExits(thenB, childrenMap, nodeMap, visiting));
+                if (elseB != null) exits.addAll(normalExits(elseB, childrenMap, nodeMap, visiting));
+                if (exits.isEmpty() && cond != null) exits.add(cond);
+            }
+            case FOR, WHILE -> {
+                for (NodeInfo c : children) {
+                    if (c.kind.contains("condition")) exits.add(c);
+                }
+                if (exits.isEmpty()) exits.add(node);
+            }
+            case DO_WHILE -> {
+                for (NodeInfo c : children) {
+                    if (c.kind.contains("condition")) exits.add(c);
+                }
+                if (exits.isEmpty()) exits.add(node);
+            }
+            case SWITCH -> {
+                if (!children.isEmpty()) {
+                    exits.add(children.get(children.size() - 1));
+                } else {
+                    exits.add(node);
+                }
+            }
+            default -> {
+                if (!children.isEmpty()) {
+                    exits.addAll(normalExits(children.get(children.size() - 1), childrenMap, nodeMap, visiting));
+                } else {
+                    exits.add(node);
+                }
+            }
+        }
+        return exits;
+    }
+
+    private NodeInfo findBlockExit(NodeInfo block, Map<Integer, NodeInfo> nodeMap,
+                                   Map<Integer, List<NodeInfo>> childrenMap, NodeInfo pseudoReturn) {
+        List<NodeInfo> children = childrenMap.getOrDefault(block.id, Collections.emptyList());
+        if (children.isEmpty()) return block;
+        return children.get(children.size() - 1);
+    }
+
+    private NodeInfo findNext(NodeInfo node, Map<Integer, NodeInfo> nodeMap,
+                              Map<Integer, List<NodeInfo>> childrenMap, List<NodeInfo> roots, NodeInfo pseudoReturn) {
+        NodeInfo parent = nodeMap.get(node.parent);
+        List<NodeInfo> siblings = parent == null ? null : childrenMap.get(parent.id);
+        if (siblings != null) {
+            for (int i = 0; i < siblings.size(); i++) {
+                if (siblings.get(i).id == node.id && i + 1 < siblings.size()) {
+                    return siblings.get(i + 1);
+                }
+            }
+        }
+        if (parent == null) {
+            for (int i = 0; i < roots.size(); i++) {
+                if (roots.get(i).id == node.id && i + 1 < roots.size()) return roots.get(i + 1);
+            }
+        }
+        if (parent != null) return findNext(parent, nodeMap, childrenMap, roots, pseudoReturn);
+        return null;
+    }
+
+    private void addEdge(List<int[]> edges, Set<String> edgeSet, int from, int to) {
+        String k = from + "->" + to;
+        if (edgeSet.add(k)) {
+            edges.add(new int[]{from, to});
+        }
+    }
 
 
     @Override
