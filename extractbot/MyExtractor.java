@@ -15,31 +15,24 @@ import java.nio.file.Paths;
 public class MyExtractor extends BaseExtractor {
 
     // 节点信息类
+    /**
+     * 用于保存解析到的 CFG 节点信息。位置字段（startX）用于保持源码顺序，kind/parent 用于识别循环结构。
+     */
     static class NodeInfo {
-        int id;
-        int parent;
-        int height;
-        int startX;
-        String kind;    // 节点类别：first-statement / for-statement / for-condition / ...
-        String code;    // 节点对应的源码片段，例如 "for (int i=0; i < length; i++) {}"
+        final int id;
+        final int parent;
+        final int height;
+        final int startX;
+        final String kind;
+        final String code;    // 节点对应的源码片段，例如 "for (int i=0; i < length; i++) {}"
 
         NodeInfo(int id, int parent, int height, int startX, String kind, String code) {
             this.id = id;
             this.parent = parent;
             this.height = height;
             this.startX = startX;
-            this.kind = kind;
-            this.code = code;
-        }
-
-        @Override
-        public String toString() {
-            return "Node{id=" + id +
-                    ", parent=" + parent +
-                    ", height=" + height +
-                    ", startX=" + startX +
-                    ", kind=" + kind +
-                    ", code=" + code + "}";
+            this.kind = kind == null ? "" : kind;
+            this.code = code == null ? "" : code;
         }
     }
 
@@ -50,14 +43,11 @@ public class MyExtractor extends BaseExtractor {
         }
 
 
-        // 【下面保留你现在的“通用实现”】
         // 1. 读取源文件
         String source;
         try {
             source = new String(Files.readAllBytes(Paths.get(pathFile)), StandardCharsets.UTF_8);
         } catch (IOException e) {
-            e.printStackTrace();
-            System.out.println("Error, cannot read source file.");
             return new int[0][0];
         }
 
@@ -70,7 +60,6 @@ public class MyExtractor extends BaseExtractor {
         @SuppressWarnings("unchecked")
         List<TypeDeclaration> types = unit.types();
         if (types == null || types.isEmpty()) {
-            System.out.println("Error, no type declaration found.");
             return new int[0][0];
         }
 
@@ -86,9 +75,19 @@ public class MyExtractor extends BaseExtractor {
         }
 
         if (targetMethod == null || targetMethod.getBody() == null) {
-            System.out.println("Error, cannot find method or method body: " + methodName);
             return new int[0][0];
         }
+
+        // 重置访问器中的静态计数器，保证每次调用编号一致
+        try {
+            Field indexField = CfgNodeVisitor.class.getDeclaredField("indexNode");
+            indexField.setAccessible(true);
+            indexField.setInt(null, 0);
+
+            Field counterField = CfgNodeVisitor.class.getDeclaredField("counterReturnStmt");
+            counterField.setAccessible(true);
+            counterField.setInt(null, 0);
+        } catch (Exception ignored) {}
 
         CfgNodeVisitor visitor = new CfgNodeVisitor(targetMethod, unit);
         targetMethod.getBody().accept(visitor);
@@ -105,11 +104,9 @@ public class MyExtractor extends BaseExtractor {
             List<LogItem> items = (List<LogItem>) listField.get(visitor);
 
             if (items == null || items.isEmpty()) {
-                System.out.println("Error, no CFG node is found.");
                 return new int[0][0];
             }
 
-            // 你现在已有的 parseNodeInfos + buildCFGEdges
             List<NodeInfo> nodeInfos = parseNodeInfos(items);
             List<int[]> edges = buildCFGEdges(nodeInfos);
 
@@ -119,15 +116,10 @@ public class MyExtractor extends BaseExtractor {
                 result[i][1] = edges.get(i)[1];
             }
 
-            System.out.println("=== Generated Edges ===");
-            for (int[] edge : edges) {
-                System.out.println("{" + edge[0] + ", " + edge[1] + "}");
-            }
 
             return result;
 
         } catch (Exception e) {
-            e.printStackTrace();
             return new int[0][0];
         }
     }
@@ -140,9 +132,8 @@ public class MyExtractor extends BaseExtractor {
         Field parentField = LogItem.class.getDeclaredField("indexNodeParent");
         Field heightField = LogItem.class.getDeclaredField("height");
 
-        // 1) 可能的 startX 字段名（根据老师输出里的 "start.x" 推测）
         Field startXField = null;
-        String[] startXCandidates = {"startX", "startx", "start_col", "startColumn", "start_x"};
+        String[] startXCandidates = {"startX", "startx", "start_col", "startColumn", "start_x", "position"};
         for (String name : startXCandidates) {
             try {
                 startXField = LogItem.class.getDeclaredField(name);
@@ -151,8 +142,7 @@ public class MyExtractor extends BaseExtractor {
         }
 
         // 2) 可能的“类型字段名”和“内容字段名”
-        Field kindField = null;    // first-statement / for-statement / for-condition ...
-        Field codeField = null;    // 源码字符串
+        Field kindField = null;
 
         String[] kindCandidates = {"strType", "nodeType", "type"};
         for (String name : kindCandidates) {
@@ -163,6 +153,7 @@ public class MyExtractor extends BaseExtractor {
         }
 
         // 内容字段名候选
+        Field codeField = null;
         String[] codeCandidates = {"content", "strContent", "code"};
         for (String name : codeCandidates) {
             try {
@@ -211,19 +202,13 @@ public class MyExtractor extends BaseExtractor {
             if ((kind == null || kind.isEmpty()) && code != null) {
                 int at = code.indexOf('@');
                 if (at >= 0) {
-                    kind = code.substring(0, at);    // first-statement / for-statement / ...
-                    code = code.substring(at + 1);   // 去掉前缀后的源码字符串
+                    kind = code.substring(0, at);
+                    code = code.substring(at + 1);  // 去掉前缀后的源码字符串
                 }
             }
 
             nodeInfos.add(new NodeInfo(cur, parent, height, startX, kind, code));
             idx++;
-        }
-
-        // 打印出来看一下真实字段长啥样
-        System.out.println("=== Parsed Nodes ===");
-        for (NodeInfo n : nodeInfos) {
-            System.out.println(n);
         }
 
         return nodeInfos;
@@ -251,35 +236,23 @@ public class MyExtractor extends BaseExtractor {
         // 按 startX 排序顶层节点，模拟代码从左到右的顺序
         topNodes.sort(Comparator.comparingInt(n -> n.startX));
 
-        System.out.println("\n=== Top Level Nodes (sorted by startX) ===");
-        for (NodeInfo n : topNodes) {
-            System.out.println("Node " + n.id + " (kind=" + n.kind +
-                    ", height=" + n.height + ", startX=" + n.startX + ")");
-        }
-
         // 3. 处理每个 for-statement：内部边 + false 分支
         for (NodeInfo top : topNodes) {
-            String kind = top.kind == null ? "" : top.kind;
-            if (kind.startsWith("for-statement")) {
-                List<NodeInfo> children = childrenMap.get(top.id);
-                if (children == null || children.isEmpty()) continue;
+            if (top.kind.startsWith("for-statement")) {
+                List<NodeInfo> children = childrenMap.getOrDefault(top.id, Collections.emptyList());
 
-                // 找出 for-condition / for-body
                 NodeInfo cond = null;
                 NodeInfo body = null;
                 for (NodeInfo child : children) {
-                    String ck = child.kind == null ? "" : child.kind;
-                    if (ck.startsWith("for-condition")) {
+                    if (child.kind.startsWith("for-condition")) {
                         cond = child;
-                    } else if (ck.startsWith("for-body")) {
+                    } else if (child.kind.startsWith("for-body")) {
                         body = child;
                     }
                 }
                 if (cond == null || body == null) {
                     continue;
                 }
-
-                System.out.println("\nFor loop node " + top.id + " cond=" + cond.id + " body=" + body.id);
 
                 // loop -> cond
                 edges.add(new int[]{top.id, cond.id});
@@ -290,17 +263,15 @@ public class MyExtractor extends BaseExtractor {
 
                 // false 分支：cond -> 下一个非循环顶层语句（且不是 pseudo-return）
                 NodeInfo nextStmt = null;
-                boolean seenSelf = false;
+                boolean seen = false;
                 for (NodeInfo tn : topNodes) {
-                    if (!seenSelf) {
-                        if (tn.id == top.id) {
-                            seenSelf = true;
-                        }
+                    if (!seen) {
+                        seen = tn.id == top.id;
                         continue;
                     }
-                    String tk = tn.kind == null ? "" : tn.kind;
-                    if (tk.startsWith("for-statement")) continue;
-                    if (tk.startsWith("pseudo-return")) continue;
+                    if (tn.kind.startsWith("for-statement") || tn.kind.startsWith("pseudo-return")) {
+                        continue;
+                    }
 
                     nextStmt = tn;
                     break;
@@ -316,24 +287,12 @@ public class MyExtractor extends BaseExtractor {
             NodeInfo cur = topNodes.get(i);
             NodeInfo nxt = topNodes.get(i + 1);
 
-            String ck = cur.kind == null ? "" : cur.kind;
-            String nk = nxt.kind == null ? "" : nxt.kind;
-
-            boolean curIsLoop = ck.startsWith("for-statement");
-            boolean nxtIsLoop = nk.startsWith("for-statement");
-            boolean nxtIsPseudoReturn = nk.startsWith("pseudo-return");
-
-            if (!curIsLoop && nxtIsLoop && !nxtIsPseudoReturn) {
+            if (!cur.kind.startsWith("for-statement")
+                    && !cur.kind.startsWith("pseudo-return")
+                    && !nxt.kind.startsWith("pseudo-return")) {
                 edges.add(new int[]{cur.id, nxt.id});
             }
         }
-
-        System.out.println("\n=== Generated CFG Edges ===");
-        for (int[] e : edges) {
-            System.out.println("{" + e[0] + ", " + e[1] + "}");
-        }
-        System.out.println("Total edges: " + edges.size());
-
         return edges;
     }
 
