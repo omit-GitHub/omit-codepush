@@ -14,7 +14,7 @@ public class ExampleTests {
 	/** TODO
 	 *	Jifeng: Change the path of "pathFile" to your local path.
 	 */
-	private String pathFile = "D:\\WHU\\Software_Testing\\extractbot\\Example.java";
+        private String pathFile = "/workspace/omit-codepush/extractbot/Example.java";
 	////////////
 	
 	private String methodName1 = "example1";
